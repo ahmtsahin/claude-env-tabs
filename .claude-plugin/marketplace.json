@@ -1,0 +1,12 @@
+{
+  "name": "claude-env-tabs",
+  "description": "env-tabs: pinned folder tabs and sidebar sections for Claude Desktop's Code tab.",
+  "owner": { "name": "Ahmet Sahin" },
+  "plugins": [
+    {
+      "name": "env-tabs",
+      "source": "./",
+      "description": "Pin folders in Claude Desktop's Code tab: each gets a tab above the prompt and a section at the top of the sidebar."
+    }
+  ]
+}

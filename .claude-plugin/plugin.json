@@ -1,0 +1,11 @@
+{
+  "name": "env-tabs",
+  "version": "0.1.0",
+  "description": "Pin folders in Claude Desktop's Code tab: each gets a tab above the prompt and a section at the top of the sidebar.",
+  "author": { "name": "Ahmet Sahin", "url": "https://github.com/ahmtsahin" },
+  "homepage": "https://github.com/ahmtsahin/claude-env-tabs",
+  "repository": "https://github.com/ahmtsahin/claude-env-tabs",
+  "license": "MIT",
+  "keywords": ["claude-desktop", "mod", "sidebar", "tabs", "pin", "sessions"],
+  "types": "./types/index.d.ts"
+}
