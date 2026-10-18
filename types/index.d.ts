@@ -19,6 +19,13 @@ export type SessionRow = {
   lastActivityAt: string
 }
 
+/**
+ * What a session wants, as the desktop's sidebar dot says: waiting on the
+ * person (a permission or a question), finished since they last looked at it,
+ * or running. An idle session has none.
+ */
+export type SessionState = 'waiting' | 'unread' | 'running'
+
 /** How the last read of the session list went. */
 export type Probe = {
   ok: boolean
@@ -37,6 +44,8 @@ declare module 'claude-code' {
       here: string
       /** Projects the person opened or closed in the pane, by their normalized folder. */
       flipped: string[]
+      /** Each listed session's state, by its id; an idle session is left out. */
+      states: Record<string, SessionState>
       probe: Probe | null
     }
   }

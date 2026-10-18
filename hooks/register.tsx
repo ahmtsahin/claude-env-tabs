@@ -1,19 +1,23 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { ElementTable, EngineInterface, Register } from 'claude-code'
 
-import type { Pin, SessionRow } from '../types'
+import type { Pin, SessionRow, SessionState } from '../types'
 
 const pins = atom({ plugin: 'env-tabs', key: 'pins' } as const, [])
 const sessions = atom({ plugin: 'env-tabs', key: 'sessions' } as const, [])
 const thisSession = atom({ plugin: 'env-tabs', key: 'thisSession' } as const, null)
 const here = atom({ plugin: 'env-tabs', key: 'here' } as const, '')
 const flipped = atom({ plugin: 'env-tabs', key: 'flipped' } as const, [])
+const states = atom({ plugin: 'env-tabs', key: 'states' } as const, {})
 const probe = atom({ plugin: 'env-tabs', key: 'probe' } as const, null)
 
 const STORE_KEY = 'pins'
 const FLIPPED_KEY = 'flipped'
 const CLOSED_KEY = 'paneClosed'
 const REFRESH_MS = 60_000
+// How often the sessions' states are read again: a session waiting on the
+// person should show soon.
+const STATES_MS = 4_000
 // The engine caps an MCP answer's size, so a long session list is asked for
 // in a smaller size when the larger one is refused.
 const LIST_LIMITS = [60, 30, 15]
@@ -105,6 +109,12 @@ const setHere = async ($: EngineInterface, folder: string) => {
 const setFlipped = async ($: EngineInterface, keys: string[]) => {
   if (!same(await read($, flipped), keys)) {
     await update($, flipped, () => keys)
+  }
+}
+
+const setStates = async ($: EngineInterface, value: Record<string, SessionState>) => {
+  if (!same(await read($, states), value)) {
+    await update($, states, () => value)
   }
 }
 
@@ -236,6 +246,210 @@ const readThisSession = async ($: EngineInterface) => {
   }
 }
 
+// The sessions' states, as the desktop's sidebar dots show them. Each running
+// session writes a file of its own under the Claude configuration folder:
+// busy, idle, or waiting on the person. The desktop keeps a record of every
+// session with when the person last looked at it and when it last did
+// something: one that did something since is unread, running or not.
+
+/** Focus written a moment before a turn's end still counts as seen. */
+const UNREAD_SLACK_MS = 2_000
+
+type Live = { host: string; status: string; at: number; updatedAt: number }
+type Seen = { focusedAt: number; activityAt: number }
+type Cached = { stamp: string; value: unknown }
+
+const join = (...parts: string[]) => parts.join(isWindowsPath(parts[0] ?? '') ? '\\' : '/')
+
+const numberOf = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+
+const fieldsOf = (text: string) => {
+  const value = parseJson(text)
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined
+}
+
+const toLive = (text: string): Live | undefined => {
+  const file = fieldsOf(text)
+  return typeof file?.hostSessionId === 'string' && typeof file.status === 'string'
+    ? {
+        host: file.hostSessionId,
+        status: file.status,
+        at: numberOf(file.statusUpdatedAt),
+        updatedAt: numberOf(file.updatedAt),
+      }
+    : undefined
+}
+
+const toSeen = (text: string): Seen | undefined => {
+  const file = fieldsOf(text)
+  return file === undefined
+    ? undefined
+    : { focusedAt: numberOf(file.lastFocusedAt), activityAt: numberOf(file.lastActivityAt) }
+}
+
+const homeOf = async ($: EngineInterface) =>
+  (await $.env.get('OS')) === 'Windows_NT' ? $.env.get('USERPROFILE') : $.env.get('HOME')
+
+/** The folder each running session writes its own file into. */
+const liveDirOf = async ($: EngineInterface) => {
+  const config = await $.env.get('CLAUDE_CONFIG_DIR')
+  const home = await homeOf($)
+
+  return config ? join(config, 'sessions') : home ? join(home, '.claude', 'sessions') : null
+}
+
+const isDir = async ($: EngineInterface, path: string) => $.fs.exists(path).catch(() => false)
+
+/**
+ * The folder of the desktop's session records: in its own folder of the
+ * user's application data, or, for the Microsoft Store build, in its package.
+ */
+const recordsDirOf = async ($: EngineInterface) => {
+  const tail = ['Claude', 'claude-code-sessions']
+  if ((await $.env.get('OS')) === 'Windows_NT') {
+    const appData = await $.env.get('APPDATA')
+    if (appData && (await isDir($, join(appData, ...tail)))) {
+      return join(appData, ...tail)
+    }
+    const localAppData = await $.env.get('LOCALAPPDATA')
+    const packages = localAppData ? join(localAppData, 'Packages') : null
+    for (const entry of packages === null ? [] : await $.fs.list(packages).catch(() => [])) {
+      const dir = join(packages ?? '', entry.name, 'LocalCache', 'Roaming', ...tail)
+      if (entry.kind === 'dir' && entry.name.startsWith('Claude_') && (await isDir($, dir))) {
+        return dir
+      }
+    }
+    return null
+  }
+  const home = await homeOf($)
+  const config = (await $.env.get('XDG_CONFIG_HOME')) || (home ? join(home, '.config') : '')
+  const candidates = [home ? join(home, 'Library', 'Application Support', ...tail) : '', config ? join(config, ...tail) : '']
+  for (const dir of candidates) {
+    if (dir !== '' && (await isDir($, dir))) {
+      return dir
+    }
+  }
+
+  return null
+}
+
+// Where the states are read from, found once per load; and the files read
+// before, by path, each read again only once its size or time moved.
+let sources: { records: string | null; live: string | null } | undefined
+let readCache = new Map<string, Cached>()
+
+const readParsed = async <T,>(
+  $: EngineInterface,
+  path: string,
+  stamp: string,
+  parse: (text: string) => T | undefined,
+  kept: Map<string, Cached>,
+) => {
+  const held = readCache.get(path)
+  const value =
+    held?.stamp === stamp
+      ? (held.value as T | undefined)
+      : parse(await $.fs.read(path).then(String, () => ''))
+  kept.set(path, { stamp, value })
+
+  return value
+}
+
+/** The running sessions' own files, the latest by session where one left another behind. */
+const readLive = async ($: EngineInterface, dir: string, kept: Map<string, Cached>) => {
+  const byHost = new Map<string, Live>()
+  for (const entry of await $.fs.list(dir).catch(() => [])) {
+    if (entry.kind !== 'file' || !entry.name.endsWith('.json')) {
+      continue
+    }
+    const file = await readParsed($, join(dir, entry.name), `${entry.size}:${entry.mtimeMs}`, toLive, kept)
+    const held = file === undefined ? undefined : byHost.get(file.host)
+    if (file !== undefined && (held === undefined || file.updatedAt >= held.updatedAt)) {
+      byHost.set(file.host, file)
+    }
+  }
+
+  return byHost
+}
+
+/** The desktop's records of the sessions wanted, by session id: each file is named for its session. */
+const readSeen = async (
+  $: EngineInterface,
+  dir: string,
+  wanted: ReadonlySet<string>,
+  kept: Map<string, Cached>,
+  depth = 0,
+): Promise<Map<string, Seen>> => {
+  const seen = new Map<string, Seen>()
+  for (const entry of await $.fs.list(dir).catch(() => [])) {
+    const path = join(dir, entry.name)
+    const id = entry.name.replace(/\.json$/, '')
+    if (entry.kind === 'dir' && depth < 3) {
+      for (const [one, record] of await readSeen($, path, wanted, kept, depth + 1)) {
+        seen.set(one, record)
+      }
+    } else if (entry.kind === 'file' && id !== entry.name && wanted.has(id)) {
+      const record = await readParsed($, path, `${entry.size}:${entry.mtimeMs}`, toSeen, kept)
+      if (record !== undefined) {
+        seen.set(id, record)
+      }
+    }
+  }
+
+  return seen
+}
+
+/** A session's state from its own file and its record; this session is never unread, it is in view. */
+const stateOf = (row: SessionRow, own: Live | undefined, seen: Seen | undefined, isMine: boolean) => {
+  if (own?.status === 'waiting') {
+    return 'waiting'
+  }
+  if (own?.status === 'busy' || (own === undefined && row.isRunning)) {
+    return 'running'
+  }
+  const doneAt = Math.max(seen?.activityAt ?? 0, own?.at ?? 0)
+
+  return seen !== undefined && !isMine && doneAt > seen.focusedAt + UNREAD_SLACK_MS ? 'unread' : undefined
+}
+
+/** Reads the listed sessions' states again; the pane and the tabs redraw where one changed. */
+const pollStates = async ($: EngineInterface) => {
+  try {
+    sources ??= { records: await recordsDirOf($), live: await liveDirOf($) }
+    const mine = await read($, thisSession)
+    const others = await read($, sessions)
+    const rows = mine === null ? others : [mine, ...others.filter(row => row.id !== mine.id)]
+    const kept = new Map<string, Cached>()
+    const live = sources.live === null ? new Map<string, Live>() : await readLive($, sources.live, kept)
+    const wanted = new Set(rows.map(row => row.id))
+    const seen = sources.records === null ? new Map<string, Seen>() : await readSeen($, sources.records, wanted, kept)
+    readCache = kept
+
+    const value: Record<string, SessionState> = {}
+    for (const row of rows) {
+      const state = stateOf(row, live.get(row.id), seen.get(row.id), row.id === mine?.id)
+      if (state !== undefined) {
+        value[row.id] = state
+      }
+    }
+    await setStates($, value)
+  } catch {
+    // The states are a hint: the next read tries again.
+  }
+}
+
+/** What status says of the states: where they are read from. */
+const statesLine = () => {
+  if (sources === undefined) {
+    return 'Session states: not read yet.'
+  }
+  if (sources.records === null && sources.live === null) {
+    return 'Session states: unavailable (no session records or session files found).'
+  }
+
+  return `Session states: read from ${sources.records ?? '(no session records)'} and ${sources.live ?? '(no session files)'}.`
+}
+
 const refresh = async ($: EngineInterface) => {
   await setPins($, await loadPins($))
   await setFlipped($, toKeys(await $.store.get(FLIPPED_KEY)))
@@ -249,6 +463,7 @@ const refresh = async ($: EngineInterface) => {
   } catch (error) {
     await update($, probe, () => ({ ok: false, error: String(error), at }))
   }
+  await pollStates($)
 }
 
 // Opening a session: its claude:// link, handed to the operating system.
@@ -434,6 +649,217 @@ const keeperOf = (e: { surface: string; component: string; requestId: string }) 
   }
 }
 
+// The look: each project's icon, the fill that marks the current row, and the
+// wash that lights a row under the pointer.
+
+/** Each pair is a light square and its dark letter; a dark theme swaps the two. */
+const SWATCHES = [
+  ['#F5C4B3', '#712B13'],
+  ['#9FE1CB', '#085041'],
+  ['#CECBF6', '#3C3489'],
+  ['#C0DD97', '#27500A'],
+  ['#B5D4F4', '#0C447C'],
+  ['#FAC775', '#633806'],
+  ['#F4C0D1', '#72243E'],
+] as const
+
+const ICON_SIZE = 20
+
+/** A project's colors, picked from its key so that a renamed tab keeps them. */
+const swatchOf = (key: string) => {
+  let hash = 0
+  for (const char of key) {
+    hash = (hash * 31 + (char.codePointAt(0) ?? 0)) >>> 0
+  }
+
+  return SWATCHES[hash % SWATCHES.length] ?? SWATCHES[0]
+}
+
+/** The first letter or digit of a name: what its icon shows. */
+const letterOf = (name: string) => (/[\p{L}\p{N}]/u.exec(name)?.[0] ?? '?').toUpperCase()
+
+const escapeXml = (text: string) => text.replace(/[<>&"']/g, char => `&#${char.charCodeAt(0)};`)
+
+const SVG_OPEN = `<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_SIZE}" height="${ICON_SIZE}" viewBox="0 0 20 20">`
+
+/** A project's letter on its square, in the theme's light or dark. */
+const letterSvg = (key: string, label: string) => {
+  const [fill, ink] = swatchOf(key)
+
+  return (
+    SVG_OPEN +
+    `<style>.s{fill:${fill}}.l{fill:${ink}}` +
+    `@media (prefers-color-scheme: dark){.s{fill:${ink}}.l{fill:${fill}}}</style>` +
+    '<rect class="s" x="2" y="2" width="16" height="16" rx="4"/>' +
+    '<text class="l" x="10" y="10.5" font-size="10" font-weight="600" ' +
+    'font-family="system-ui, -apple-system, Segoe UI, sans-serif" text-anchor="middle" ' +
+    `dominant-baseline="central">${escapeXml(letterOf(label))}</text></svg>`
+  )
+}
+
+/** This computer's icon: a screen on its stand. */
+const COMPUTER_SVG =
+  SVG_OPEN +
+  '<style>.m{stroke:#73726c}@media (prefers-color-scheme: dark){.m{stroke:#a3a29c}}</style>' +
+  '<g class="m" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
+  '<rect x="3" y="4" width="14" height="9.5" rx="1.5"/><path d="M7.5 16.5h5M10 13.5v3"/></g></svg>'
+
+/**
+ * A project's icon: an SVG where the surface draws one, else its letter in a
+ * colored cell. The terminal's table answers Svg too, with an empty stand-in.
+ */
+const iconOf = (els: ElementTable, surface: string, key: string, label: string) => {
+  const { Text } = els
+  if (surface !== 'terminal' && 'Svg' in els) {
+    const { Svg } = els
+    const source = key === SCRATCH_KEY ? COMPUTER_SVG : letterSvg(key, label)
+
+    return <Svg source={source} alt={label} width={ICON_SIZE} height={ICON_SIZE} />
+  }
+  if (key === SCRATCH_KEY) {
+    return <Text dimColor>{' ▪ '}</Text>
+  }
+  const [fill, ink] = swatchOf(key)
+
+  return (
+    <Text backgroundColor={fill} color={ink}>
+      {` ${letterOf(label)} `}
+    </Text>
+  )
+}
+
+// The desktop's own fill for what is selected, and a wash for what the pointer is over.
+const ACTIVE = 'userMessageBackground'
+const LIT = 'rgba(128, 128, 128, 0.14)'
+
+/** Whether a surface has a pointer to hover with: the terminal and the phone have none. */
+const canHover = (surface: string) => surface === 'desktop' || surface === 'vscode'
+
+/** A row's fill: the selected row filled, any other lit while the pointer is over it. */
+const fillOf = (surface: string, isSelected: boolean) =>
+  isSelected
+    ? { backgroundColor: ACTIVE }
+    : canHover(surface)
+      ? { backgroundColor: 'transparent', hover: { backgroundColor: LIT } }
+      : {}
+
+/** A Button in a lit row: its own highlight under the pointer off, the row's is enough. */
+const quietOf = (surface: string) =>
+  canHover(surface) ? { hover: { backgroundColor: 'transparent' } } : {}
+
+// A session's state as the sidebar's dot draws it, and the count of a
+// project's sessions that need the person, in the color of the most urgent.
+
+type Shown = SessionState | 'idle'
+
+/** Each state's dot: [light theme, dark theme]. */
+const DOT_COLORS: Record<Shown, readonly [string, string]> = {
+  waiting: ['#BA7517', '#EF9F27'],
+  unread: ['#378ADD', '#85B7EB'],
+  running: ['#888780', '#B4B2A9'],
+  idle: ['#B4B2A9', '#5F5E5A'],
+}
+
+/** A count's pill: [fill, number] in a light theme, then in a dark one. */
+const BADGE_COLORS = {
+  waiting: ['#FAEEDA', '#633806', '#633806', '#FAC775'],
+  unread: ['#E6F1FB', '#0C447C', '#0C447C', '#B5D4F4'],
+} as const
+
+const STATE_LABELS: Record<Shown, string> = {
+  waiting: 'Waiting for you',
+  unread: 'Unread',
+  running: 'Running',
+  idle: 'Idle',
+}
+
+/** The terminal's theme colors for the states. */
+const STATE_THEME: Record<SessionState, string> = {
+  waiting: 'warning',
+  unread: 'suggestion',
+  running: 'inactive',
+}
+
+const DOT_WIDTH = 12
+
+/** A state's dot: filled, pulsing while the session runs, a ring when it is idle. */
+const dotSvg = (state: Shown) => {
+  const [light, dark] = DOT_COLORS[state]
+  const paint = state === 'idle' ? 'fill:none;stroke:' : 'fill:'
+  const pulse =
+    state === 'running'
+      ? '<animate attributeName="opacity" values="1;0.35;1" dur="1.6s" repeatCount="indefinite"/>'
+      : ''
+
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${DOT_WIDTH}" height="${ICON_SIZE}" viewBox="0 0 ${DOT_WIDTH} ${ICON_SIZE}">` +
+    `<style>.d{${paint}${light}}@media (prefers-color-scheme: dark){.d{${paint}${dark}}}</style>` +
+    `<circle class="d" cx="6" cy="10" r="${state === 'idle' ? 3.25 : 4}" stroke-width="1.5">${pulse}</circle></svg>`
+  )
+}
+
+/** A count as a pill, and how wide it is drawn. */
+const badgeSvg = (count: number, state: keyof typeof BADGE_COLORS) => {
+  const text = count > 99 ? '99+' : String(count)
+  const width = Math.max(18, 10 + text.length * 6)
+  const [fill, ink, darkFill, darkInk] = BADGE_COLORS[state]
+  const source =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${ICON_SIZE}" viewBox="0 0 ${width} ${ICON_SIZE}">` +
+    `<style>.p{fill:${fill}}.n{fill:${ink}}` +
+    `@media (prefers-color-scheme: dark){.p{fill:${darkFill}}.n{fill:${darkInk}}}</style>` +
+    `<rect class="p" x="0" y="2" width="${width}" height="16" rx="8"/>` +
+    `<text class="n" x="${width / 2}" y="10.5" font-size="10.5" font-weight="600" ` +
+    'font-family="system-ui, -apple-system, Segoe UI, sans-serif" text-anchor="middle" ' +
+    `dominant-baseline="central">${text}</text></svg>`
+
+  return { source, width }
+}
+
+/** A session's dot: an SVG where the surface draws one, else a glyph in the theme's color. */
+const dotOf = (els: ElementTable, surface: string, state: SessionState | undefined) => {
+  const { Text } = els
+  if (surface !== 'terminal' && 'Svg' in els) {
+    const { Svg } = els
+    const shown = state ?? 'idle'
+
+    return <Svg source={dotSvg(shown)} alt={STATE_LABELS[shown]} width={DOT_WIDTH} height={ICON_SIZE} />
+  }
+
+  return state === undefined ? <Text>{' '}</Text> : <Text color={STATE_THEME[state]}>●</Text>
+}
+
+/**
+ * What a project's row and tab show of its sessions: how many wait for the
+ * person or are unread, else a running dot while one runs, else nothing.
+ */
+const markOf = (
+  els: ElementTable,
+  surface: string,
+  ids: readonly string[],
+  value: Readonly<Record<string, SessionState>>,
+) => {
+  const list = ids.map(id => value[id])
+  const waiting = list.filter(state => state === 'waiting').length
+  const need = waiting + list.filter(state => state === 'unread').length
+  if (need === 0) {
+    return list.includes('running') ? dotOf(els, surface, 'running') : null
+  }
+  const state = waiting > 0 ? 'waiting' : 'unread'
+  const { Text } = els
+  if (surface !== 'terminal' && 'Svg' in els) {
+    const { Svg } = els
+    const { source, width } = badgeSvg(need, state)
+
+    return <Svg source={source} alt={`${need} need you`} width={width} height={ICON_SIZE} />
+  }
+
+  return (
+    <Text color={STATE_THEME[state]} bold>
+      {String(need)}
+    </Text>
+  )
+}
+
 /** Opens the pane at the person's ask: what to tell them when it is not drawn, or nothing. */
 const showPane = async ($: EngineInterface) => {
   await $.store.set(CLOSED_KEY, false)
@@ -540,6 +966,7 @@ const status = async ($: EngineInterface) => {
     last?.ok
       ? `Session list: ${rows.length} other sessions read.`
       : `Session list: unavailable (${last?.error ?? 'not read yet'}).`,
+    statesLine(),
     '',
     describe(await read($, pins), rows),
   ].join('\n')
@@ -644,8 +1071,11 @@ export const register: Register = on => {
       isDeferred: true,
     })
     const started = await next(e)
+    sources = undefined
+    readCache = new Map()
     void refresh($)
     $.clock.every(REFRESH_MS, () => refresh($))
+    $.clock.every(STATES_MS, () => pollStates($))
     // The pane opens by itself where the surface has room for it beside the
     // transcript, unless the person closed it.
     if ((await $.store.get(CLOSED_KEY)) !== true) {
@@ -679,29 +1109,45 @@ export const register: Register = on => {
     }
 
     const list = await read($, pins)
-    const rows = await read($, sessions)
+    const mine = await read($, thisSession)
+    const others = await read($, sessions)
+    const value = await read($, states)
+    const rows = mine === null ? others : [mine, ...others.filter(row => row.id !== mine.id)]
     const current = pinOf(folder, list)
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const els = $.ui.resolve(e)
+    const { Box, Button } = els
     const keep = keeperOf(e)
+    const quiet = quietOf(e.surface)
 
     return (
-      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+      <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1}>
         {list.map(pin => {
           const key = `tab:${normalize(pin.folder)}`
-          const variant = current?.folder === pin.folder ? 'primary' : 'secondary'
-          const isBusy = rows.some(
-            row => row.isRunning && pinOf(row.folder, list)?.folder === pin.folder,
-          )
+          const isCurrent = current?.folder === pin.folder
+          const ids = rows.filter(row => pinOf(row.folder, list)?.folder === pin.folder).map(row => row.id)
 
-          return keep(key, [pin, variant, isBusy], () =>
-            isBusy ? (
-              <Button key={key} variant={variant} onPress={() => goTo($, pin)}>
-                {pin.label}
-                <Text dimColor> ●</Text>
-              </Button>
-            ) : (
-              <Button key={key} variant={variant} label={pin.label} onPress={() => goTo($, pin)} />
-            ),
+          return (
+            <Box
+              key={`tabrow:${normalize(pin.folder)}`}
+              flexDirection="row"
+              alignItems="center"
+              columnGap={1}
+              paddingRight={1}
+              {...fillOf(e.surface, isCurrent)}
+            >
+              {iconOf(els, e.surface, keyOf(pin.folder), pin.label)}
+              {keep(key, [pin, isCurrent], () => (
+                <Button
+                  key={key}
+                  plain
+                  dimColor={!isCurrent}
+                  {...quiet}
+                  label={pin.label}
+                  onPress={() => goTo($, pin)}
+                />
+              ))}
+              {markOf(els, e.surface, ids, value)}
+            </Box>
           )
         })}
         {current === undefined &&
@@ -733,12 +1179,14 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const els = $.ui.resolve(e)
+    const { Box, Button, Text } = els
     const list = await read($, pins)
     const mine = await read($, thisSession)
     const others = await read($, sessions)
     const folder = await read($, here)
     const flips = await read($, flipped)
+    const value = await read($, states)
     const last = await read($, probe)
     const now = last?.at ?? 0
     const room = Math.max(8, e.props.bodyColumns - 10)
@@ -748,24 +1196,42 @@ export const register: Register = on => {
     const { pinned, rest } = projectsOf(list, rows)
     const current = folder === '' ? '' : keyOf(folder)
     const keep = keeperOf(e)
+    const quiet = quietOf(e.surface)
+    // + New and Pin or Unpin show while the pointer is over their project's row.
+    const onHover = canHover(e.surface) ? ({ display: 'none', hover: { display: 'flex' } } as const) : {}
 
+    // A session's age stands at the end of its row, outside its button: the
+    // button stays as it was while the age moves on.
     const sessionRow = (row: SessionRow) => {
       const key = `session:${row.id}`
       const title = clip(row.title || 'Untitled session', room)
       const when = row.id === mine?.id ? 'here' : ago(row.lastActivityAt, now)
 
-      return keep(key, [row.title, row.link, row.isRunning, title, when], () => (
-        <Button key={key} plain onPress={() => openSession($, row)}>
-          {title}
-          <Text dimColor> {when}</Text>
-          {row.isRunning && <Text dimColor> ●</Text>}
-        </Button>
-      ))
+      return (
+        <Box
+          key={`srow:${row.id}`}
+          flexDirection="row"
+          alignItems="center"
+          columnGap={1}
+          {...fillOf(e.surface, false)}
+        >
+          {dotOf(els, e.surface, value[row.id])}
+          <Box flexGrow={1} flexShrink={1}>
+            {keep(key, [row.title, row.link, title], () => (
+              <Button key={key} plain {...quiet} onPress={() => openSession($, row)}>
+                {title}
+              </Button>
+            ))}
+          </Box>
+          <Text dimColor tabular>
+            {when}
+          </Text>
+        </Box>
+      )
     }
 
     const projectRow = (project: Project) => {
       const isOpen = project.isPinned !== flips.includes(project.key)
-      const isBusy = project.rows.some(row => row.isRunning)
       const isCurrent = project.key === current
       const label = clip(project.label, labelRoom)
       const hidden = project.rows.length - SHOWN
@@ -776,7 +1242,7 @@ export const register: Register = on => {
 
       // This computer has no folder to start a session in, or to pin.
       const actions = (path: string) => (
-        <Box flexDirection="row" columnGap={1}>
+        <Box flexDirection="row" columnGap={1} {...onHover}>
           {keep(newKey, [path, project.label], () => (
             <Button
               key={newKey}
@@ -810,14 +1276,28 @@ export const register: Register = on => {
 
       return (
         <Box key={`project:${project.key}`} flexDirection="column">
-          <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
-            {keep(foldKey, [isOpen, isCurrent, label, isBusy], () => (
-              <Button key={foldKey} plain onPress={() => setFlip($, project.key)}>
-                {isOpen ? '▾ ' : '▸ '}
-                <Text weight={isCurrent ? 'bold' : 'medium'}>{label}</Text>
-                {isBusy && <Text dimColor> ●</Text>}
-              </Button>
-            ))}
+          <Box
+            key={`row:${project.key}`}
+            flexDirection="row"
+            alignItems="center"
+            columnGap={1}
+            {...fillOf(e.surface, isCurrent)}
+          >
+            {iconOf(els, e.surface, project.key, project.label)}
+            <Box flexGrow={1} flexShrink={1}>
+              {keep(foldKey, [isOpen, isCurrent, label], () => (
+                <Button key={foldKey} plain {...quiet} onPress={() => setFlip($, project.key)}>
+                  <Text weight={isCurrent ? 'bold' : 'medium'}>{label}</Text>
+                  <Text dimColor>{isOpen ? ' ▾' : ' ▸'}</Text>
+                </Button>
+              ))}
+            </Box>
+            {markOf(
+              els,
+              e.surface,
+              project.rows.map(row => row.id),
+              value,
+            )}
             {project.folder !== null && actions(project.folder)}
           </Box>
           {isOpen && (
@@ -834,7 +1314,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" rowGap={1}>
         <Box flexDirection="column">
-          <Text dimColor weight="semibold">
+          <Text dimColor size="caption" weight="medium">
             Pinned
           </Text>
           {pinned.length === 0 && <Text dimColor>Pin a project to keep it here.</Text>}
@@ -842,7 +1322,7 @@ export const register: Register = on => {
         </Box>
         {rest.length > 0 && (
           <Box flexDirection="column">
-            <Text dimColor weight="semibold">
+            <Text dimColor size="caption" weight="medium">
               Projects
             </Text>
             {rest.map(projectRow)}
