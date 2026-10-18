@@ -1,12 +1,12 @@
 {
   "name": "claude-env-tabs",
-  "description": "env-tabs: pinned folder tabs and sidebar sections for Claude Desktop's Code tab.",
+  "description": "env-tabs: pinned projects in a Projects pane and tabs for Claude Desktop's Code tab.",
   "owner": { "name": "Ahmet Sahin" },
   "plugins": [
     {
       "name": "env-tabs",
       "source": "./",
-      "description": "Pin folders in Claude Desktop's Code tab: each gets a tab above the prompt and a section at the top of the sidebar."
+      "description": "Pin projects in Claude Desktop's Code tab: a Projects pane with the pinned ones on top, and a tab above the prompt for each."
     }
   ]
 }
