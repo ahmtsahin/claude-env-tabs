@@ -65,7 +65,13 @@ const RECORDS = `${USER}\\AppData\\Roaming\\Claude\\claude-code-sessions`
  * file written again reads as changed.
  */
 const fileSystem = (on: On, files: Record<string, object>) => {
-  const norm = (path: string) => path.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
+  // A Windows host hands a macOS path on with its own drive in front: /Users is D:\Users.
+  const norm = (path: string) =>
+    path
+      .replace(/\//g, '\\')
+      .replace(/\\+$/, '')
+      .toLowerCase()
+      .replace(/^[a-z]:/, '')
   const held = new Map<string, { path: string; text: string; version: number }>()
   let version = 1
   const put = (path: string, value: object) => {
@@ -814,5 +820,40 @@ describe('session states', () => {
     world(on, { rows: ROWS, files: FILES })
 
     expect(await statusOf($)).toContain(`Session states: read from ${RECORDS} and ${LIVE}`)
+  })
+
+  test('reads the states where macOS keeps them', async ($, on) => {
+    const home = '/Users/me'
+    const files = {
+      [`${home}/.claude/sessions/1.json`]: {
+        pid: 1,
+        hostSessionId: 'local_w',
+        status: 'waiting',
+        statusUpdatedAt: AT,
+        updatedAt: AT,
+      },
+      [`${home}/Library/Application Support/Claude/claude-code-sessions/account/org/local_u.json`]: {
+        sessionId: 'local_u',
+        lastFocusedAt: AT - 60_000,
+        lastActivityAt: AT,
+        isArchived: false,
+      },
+    }
+    world(on, {
+      os: '',
+      root: `${home}/code/shop`,
+      rows: [
+        session('local_w', `${home}/code/shop`, '2026-10-16T11:50:00Z'),
+        session('local_u', `${home}/code/shop`, '2026-10-16T11:40:00Z'),
+      ],
+      files,
+    })
+    await pin($, `${home}/code/shop`)
+    const drawn = await (await mountPane($, 'desktop')).drawn()
+
+    expect(await statusOf($)).toContain(
+      `Session states: read from ${home}/Library/Application Support/Claude/claude-code-sessions and ${home}/.claude/sessions`,
+    )
+    expect([altIn(drawn, 'srow:local_w'), altIn(drawn, 'srow:local_u')]).toEqual(['Waiting for you', 'Unread'])
   })
 })

@@ -1,6 +1,6 @@
 {
   "name": "env-tabs",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Pin projects in Claude Desktop's Code tab: a Projects pane with the pinned ones on top, and a tab above the prompt for each.",
   "author": { "name": "Ahmet Sahin", "url": "https://github.com/ahmtsahin" },
   "homepage": "https://github.com/ahmtsahin/claude-env-tabs",

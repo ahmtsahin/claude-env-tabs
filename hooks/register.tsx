@@ -333,8 +333,9 @@ const recordsDirOf = async ($: EngineInterface) => {
   return null
 }
 
-// Where the states are read from, found once per load; and the files read
-// before, by path, each read again only once its size or time moved.
+// Where the states are read from, looked for again at every refresh so that a
+// folder made later is found; and the files read before, by path, each read
+// again only once its size or time moved.
 let sources: { records: string | null; live: string | null } | undefined
 let readCache = new Map<string, Cached>()
 
@@ -463,6 +464,7 @@ const refresh = async ($: EngineInterface) => {
   } catch (error) {
     await update($, probe, () => ({ ok: false, error: String(error), at }))
   }
+  sources = { records: await recordsDirOf($), live: await liveDirOf($) }
   await pollStates($)
 }
 
